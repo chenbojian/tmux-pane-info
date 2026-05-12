@@ -68,6 +68,68 @@ func findClaudePanes(panePids: Set<pid_t>, processes: [pid_t: ProcInfo]) -> Set<
     return claudePanes
 }
 
+func getProcessArgs(_ pid: pid_t) -> String? {
+    var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    var size: Int = 0
+    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return nil }
+
+    var buf = [UInt8](repeating: 0, count: size)
+    guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return nil }
+
+    // KERN_PROCARGS2 layout: [argc: Int32][execpath\0][padding\0...][argv0\0][argv1\0]...
+    guard size > MemoryLayout<Int32>.size else { return nil }
+    let argc = buf.withUnsafeBufferPointer { ptr in
+        ptr.baseAddress!.withMemoryRebound(to: Int32.self, capacity: 1) { $0.pointee }
+    }
+    guard argc > 0 else { return nil }
+
+    // Skip past argc and exec_path
+    var pos = MemoryLayout<Int32>.size
+    while pos < size && buf[pos] != 0 { pos += 1 }
+    // Skip null padding
+    while pos < size && buf[pos] == 0 { pos += 1 }
+
+    // Collect argv strings
+    var args: [String] = []
+    var collected: Int32 = 0
+    while pos < size && collected < argc {
+        let start = pos
+        while pos < size && buf[pos] != 0 { pos += 1 }
+        let arg = String(bytes: buf[start..<pos], encoding: .utf8) ?? ""
+        args.append(arg)
+        collected += 1
+        pos += 1
+    }
+
+    guard !args.isEmpty else { return nil }
+
+    // Use basename of argv[0] + rest of args
+    let execName = (args[0] as NSString).lastPathComponent
+    var result = execName
+    if args.count > 1 {
+        result += " " + args[1...].joined(separator: " ")
+    }
+
+    if result.count > 40 {
+        let idx = result.index(result.startIndex, offsetBy: 37)
+        result = String(result[...idx]) + "..."
+    }
+
+    return result
+}
+
+func getFirstChildArgs(panePid: pid_t, processes: [pid_t: ProcInfo]) -> String? {
+    // Find the first child of the pane pid (the foreground process)
+    for (_, info) in processes {
+        if info.ppid == panePid && info.pid != panePid {
+            if let args = getProcessArgs(info.pid) {
+                return args
+            }
+        }
+    }
+    return nil
+}
+
 func getTmuxPanes() -> [(id: String, windowName: String, pid: pid_t, command: String, path: String)] {
     let process = Process()
     let pipe = Pipe()
@@ -117,7 +179,14 @@ struct TmuxPaneInfo {
         let claudePanes = findClaudePanes(panePids: panePids, processes: processes)
 
         for pane in panes {
-            let command = claudePanes.contains(pane.pid) ? "claude" : pane.command
+            let command: String
+            if claudePanes.contains(pane.pid) {
+                command = "claude"
+            } else if let args = getFirstChildArgs(panePid: pane.pid, processes: processes) {
+                command = args
+            } else {
+                command = pane.command
+            }
             var path = pane.path
             if !homeDir.isEmpty && path.hasPrefix(homeDir) {
                 path = "~" + path.dropFirst(homeDir.count)
